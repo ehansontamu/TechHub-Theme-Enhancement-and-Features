@@ -4,12 +4,12 @@
   // =========================
   // SETTINGS
   // =========================
-  var STORAGE_KEY = "techhub_first_visit_notice_dismissed_v1";
+  var STORAGE_KEY = "techhub_first_visit_notice_dismissed_v2";
   var NOTICE_DURATION = 1000 * 60 * 60 * 48; // 48 hours
 
   var MODAL_TITLE = "Please Note:";
   var MODAL_BODY =
-    "In response to technology market conditions and trends, TechHub pricing will be subject to change without notice until markets normalize.";
+    "Due to ongoing changes in the technology market, product pricing is subject to change without notice. We appreciate your understanding as we work to provide competitive pricing and availability.";
 
   var BUTTON_TEXT = "I Understand";
 
