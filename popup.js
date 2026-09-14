@@ -5,11 +5,11 @@
   // SETTINGS
   // =========================
   var STORAGE_KEY = "techhub_first_visit_notice_dismissed_v1";
-  var TWO_WEEKS = 1000 * 60 * 60 * 24 * 14;
+  var NOTICE_DURATION = 1000 * 60 * 60 * 48; // 48 hours
 
   var MODAL_TITLE = "Please Note:";
   var MODAL_BODY =
-    "In response to technology market conditions and trends, TechHub pricing will be subject to change without notice until markets normalize";
+    "In response to technology market conditions and trends, TechHub pricing will be subject to change without notice until markets normalize.";
 
   var BUTTON_TEXT = "I Understand";
 
@@ -21,12 +21,11 @@
   // HELPERS
   // =========================
   function migrateOldValueIfNeeded() {
-    // Old script stored: "true"
-    // New script stores: timestamp string
+    // Old script stored "true"; this script stores a timestamp.
     try {
-      var v = localStorage.getItem(STORAGE_KEY);
-      if (v === "true") {
-        // Explicitly delete old value and replace with timestamp
+      var value = localStorage.getItem(STORAGE_KEY);
+
+      if (value === "true") {
         localStorage.removeItem(STORAGE_KEY);
         localStorage.setItem(STORAGE_KEY, Date.now().toString());
       }
@@ -36,12 +35,17 @@
   function shouldShowModal() {
     try {
       var lastDismissed = localStorage.getItem(STORAGE_KEY);
+
+      // Show immediately if the notice has never been dismissed.
       if (!lastDismissed) return true;
 
-      var ts = parseInt(lastDismissed, 10);
-      if (!isFinite(ts)) return true; // anything weird => show
+      var timestamp = parseInt(lastDismissed, 10);
 
-      return (Date.now() - ts) > TWO_WEEKS;
+      // Show if the stored value is invalid.
+      if (!isFinite(timestamp)) return true;
+
+      // Show again 48 hours after the last dismissal.
+      return Date.now() - timestamp >= NOTICE_DURATION;
     } catch (e) {
       return true;
     }
@@ -101,6 +105,7 @@
     var modal = document.createElement("div");
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "techhub-modal-title");
     modal.tabIndex = -1;
 
     modal.style.width = "min(720px, 96vw)";
@@ -115,9 +120,10 @@
     header.style.borderBottom = "1px solid rgba(0,0,0,0.08)";
 
     var title = document.createElement("div");
+    title.id = "techhub-modal-title";
     title.textContent = MODAL_TITLE;
     title.style.fontFamily =
-      "'Work Sans', system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
+      "'Work Sans', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif";
     title.style.fontSize = "26px";
     title.style.fontWeight = "600";
     title.style.color = COLOR_TEXT;
@@ -128,7 +134,7 @@
     var bodyText = document.createElement("div");
     bodyText.textContent = MODAL_BODY;
     bodyText.style.fontFamily =
-      "'Work Sans', system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
+      "'Work Sans', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif";
     bodyText.style.fontSize = "18px";
     bodyText.style.lineHeight = "1.5";
     bodyText.style.color = COLOR_TEXT;
@@ -139,9 +145,10 @@
     footer.style.justifyContent = "flex-end";
 
     var okBtn = document.createElement("button");
+    okBtn.type = "button";
     okBtn.textContent = BUTTON_TEXT;
     okBtn.style.fontFamily =
-      "'Work Sans', system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
+      "'Work Sans', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif";
     okBtn.style.fontWeight = "700";
     okBtn.style.textTransform = "uppercase";
     okBtn.style.fontSize = "12pt";
@@ -155,6 +162,7 @@
     okBtn.addEventListener("mouseenter", function () {
       okBtn.style.background = COLOR_MAROON_DARK;
     });
+
     okBtn.addEventListener("mouseleave", function () {
       okBtn.style.background = COLOR_MAROON;
     });
@@ -175,14 +183,13 @@
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
 
-    modal.focus();
+    okBtn.focus();
   }
 
   // =========================
   // RUN
   // =========================
   onReady(function () {
-    // One-time migration: old "true" -> timestamp
     migrateOldValueIfNeeded();
 
     if (shouldShowModal()) {
