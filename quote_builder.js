@@ -125,6 +125,25 @@ const PDF_COMPATIBILITY_NAME_MAX_CHARS = 64;
 const QUOTE_PDF_TEST_NAMESPACE = "__quotePdfTest";
 const QUOTE_PDF_FIXTURE_VERSION = "1";
 const QUOTE_PDF_TEST_QUERY_PARAM = "quotePdfTest";
+const QUOTE_CART_MANIFEST_SCHEMA = "techhub-cart-v1";
+const QUOTE_CART_MANIFEST_PREFIX = "TECHHUB_CART_V1:";
+const STOREFRONT_CARTS_URL =
+  "/api/storefront/carts?include=lineItems.digitalItems.options,lineItems.physicalItems.options";
+const QUOTE_IMPORT_BUTTON_ID = "upload-quote-pdf-btn";
+const QUOTE_IMPORT_INPUT_ID = "upload-quote-pdf-input";
+const QUOTE_IMPORT_STATUS_ID = "techhub-quote-import-status";
+const QUOTE_IMPORT_MODAL_ID = "techhub-quote-import-modal";
+const QUOTE_IMPORT_MODAL_TITLE_ID = "techhub-quote-import-modal-title";
+const QUOTE_IMPORT_MODAL_DESCRIPTION_ID =
+  "techhub-quote-import-modal-description";
+const QUOTE_IMPORT_RESULT_STORAGE_KEY = "techhubQuoteImportResult";
+const QUOTE_IMPORT_MAX_FILE_BYTES = 25 * 1024 * 1024;
+const QUOTE_IMPORT_MAX_ITEMS = 250;
+const QUOTE_IMPORT_MAX_QUANTITY = 1000;
+const QUOTE_IMPORT_TEST_HOST_ALIASES = [
+  "techhubtest.mybigcommerce.com",
+  "store-jje9unvzjs.mybigcommerce.com",
+];
 
 let latestQuotePdfSnapshot = null;
 
@@ -277,6 +296,1309 @@ function extractCartData() {
     items,
     grandTotalText,
   };
+}
+
+// =========================================
+// Restorable Cart Manifest
+// =========================================
+
+function normalizeManifestOptionSelections(options) {
+  if (!Array.isArray(options)) {
+    return [];
+  }
+
+  return options
+    .map((option) => {
+      const optionId = Number(option?.nameId);
+      const optionValue =
+        option?.valueId !== null && option?.valueId !== undefined
+          ? option.valueId
+          : option?.value;
+
+      if (
+        !Number.isInteger(optionId) ||
+        optionId <= 0 ||
+        optionValue === null ||
+        optionValue === undefined ||
+        optionValue === ""
+      ) {
+        return null;
+      }
+
+      return {
+        optionId,
+        optionValue,
+      };
+    })
+    .filter(Boolean);
+}
+
+function getStorefrontLineItemUnitPrice(item) {
+  const salePrice =
+    item?.salePrice === null || item?.salePrice === undefined
+      ? Number.NaN
+      : Number(item.salePrice);
+  if (Number.isFinite(salePrice) && salePrice >= 0) {
+    return salePrice;
+  }
+
+  const extendedSalePrice =
+    item?.extendedSalePrice === null || item?.extendedSalePrice === undefined
+      ? Number.NaN
+      : Number(item.extendedSalePrice);
+  const quantity = Number(item?.quantity);
+  if (
+    Number.isFinite(extendedSalePrice) &&
+    extendedSalePrice >= 0 &&
+    Number.isFinite(quantity) &&
+    quantity > 0
+  ) {
+    return extendedSalePrice / quantity;
+  }
+
+  const listPrice =
+    item?.listPrice === null || item?.listPrice === undefined
+      ? Number.NaN
+      : Number(item.listPrice);
+  return Number.isFinite(listPrice) && listPrice >= 0 ? listPrice : null;
+}
+
+function buildCartManifestFromStorefrontCart(cart) {
+  if (!cart || typeof cart !== "object") {
+    throw new Error("The Storefront Cart API did not return a cart.");
+  }
+
+  const lineItems = cart.lineItems || {};
+  const restorableItems = [
+    ...(Array.isArray(lineItems.physicalItems)
+      ? lineItems.physicalItems
+      : []),
+    ...(Array.isArray(lineItems.digitalItems) ? lineItems.digitalItems : []),
+  ];
+  const unsupportedItemCount =
+    (Array.isArray(lineItems.customItems) ? lineItems.customItems.length : 0) +
+    (Array.isArray(lineItems.giftCertificates)
+      ? lineItems.giftCertificates.length
+      : 0);
+
+  if (unsupportedItemCount > 0) {
+    throw new Error(
+      "This cart contains custom items or gift certificates that cannot be restored from a quote PDF.",
+    );
+  }
+
+  const currencyCode =
+    typeof cart?.currency?.code === "string" &&
+    /^[A-Za-z]{3}$/.test(cart.currency.code)
+      ? cart.currency.code.toUpperCase()
+      : "USD";
+
+  const items = restorableItems.map((item) => {
+    const productId = Number(item?.productId);
+    const variantId = Number(item?.variantId);
+    const quantity = Number(item?.quantity);
+
+    if (
+      !Number.isInteger(productId) ||
+      productId <= 0 ||
+      !Number.isInteger(quantity) ||
+      quantity <= 0
+    ) {
+      throw new Error(
+        "The cart contains an item without a valid product ID or quantity.",
+      );
+    }
+
+    const manifestItem = {
+      productId,
+      quantity,
+      optionSelections: normalizeManifestOptionSelections(item.options),
+    };
+
+    const quotedUnitPrice = getStorefrontLineItemUnitPrice(item);
+    if (quotedUnitPrice !== null) {
+      manifestItem.quotedUnitPrice = quotedUnitPrice;
+    }
+
+    if (Number.isInteger(variantId) && variantId > 0) {
+      manifestItem.variantId = variantId;
+    }
+
+    if (typeof item?.name === "string" && item.name.trim()) {
+      manifestItem.name = item.name.trim();
+    }
+
+    if (typeof item?.sku === "string" && item.sku.trim()) {
+      manifestItem.sku = item.sku.trim();
+    }
+
+    return manifestItem;
+  });
+
+  if (!items.length) {
+    throw new Error("The current cart does not contain any restorable items.");
+  }
+
+  return {
+    schema: QUOTE_CART_MANIFEST_SCHEMA,
+    createdAt: new Date().toISOString(),
+    currencyCode,
+    storeHost:
+      typeof window !== "undefined" && window.location
+        ? window.location.hostname
+        : "",
+    items,
+  };
+}
+
+async function fetchCurrentCartManifest() {
+  const response = await fetch(STOREFRONT_CARTS_URL, {
+    method: "GET",
+    credentials: "same-origin",
+    headers: {
+      Accept: "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Storefront Cart API request failed with status ${response.status}.`,
+    );
+  }
+
+  const carts = await response.json();
+  const currentCart = Array.isArray(carts) ? carts[0] : carts;
+  return buildCartManifestFromStorefrontCart(currentCart);
+}
+
+function encodeUtf8Base64(value) {
+  const stringValue = String(value);
+
+  if (typeof TextEncoder === "function") {
+    const bytes = new TextEncoder().encode(stringValue);
+    const chunks = [];
+    const chunkSize = 0x8000;
+
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+      chunks.push(
+        String.fromCharCode(...bytes.subarray(index, index + chunkSize)),
+      );
+    }
+
+    return btoa(chunks.join(""));
+  }
+
+  return btoa(unescape(encodeURIComponent(stringValue)));
+}
+
+function buildCartManifestPdfSubject(cartManifest) {
+  if (
+    !cartManifest ||
+    cartManifest.schema !== QUOTE_CART_MANIFEST_SCHEMA ||
+    !Array.isArray(cartManifest.items) ||
+    !cartManifest.items.length
+  ) {
+    throw new Error("Cannot export a quote PDF without a valid cart manifest.");
+  }
+
+  return `${QUOTE_CART_MANIFEST_PREFIX}${encodeUtf8Base64(
+    JSON.stringify(cartManifest),
+  )}`;
+}
+
+function decodeUtf8Base64(value) {
+  let binaryText;
+  try {
+    binaryText = atob(String(value).replace(/\s+/g, ""));
+  } catch (error) {
+    throw new Error("The quote PDF contains invalid encoded cart data.");
+  }
+
+  const bytes = new Uint8Array(binaryText.length);
+  for (let index = 0; index < binaryText.length; index += 1) {
+    bytes[index] = binaryText.charCodeAt(index);
+  }
+
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new Error("The quote PDF cart data is not valid UTF-8 text.");
+  }
+}
+
+function decodePdfHexString(hexValue) {
+  const normalizedHex = String(hexValue).replace(/\s+/g, "");
+  if (!normalizedHex || normalizedHex.length % 2 !== 0) {
+    return "";
+  }
+
+  const bytes = new Uint8Array(normalizedHex.length / 2);
+  for (let index = 0; index < normalizedHex.length; index += 2) {
+    const byteValue = Number.parseInt(normalizedHex.slice(index, index + 2), 16);
+    if (!Number.isFinite(byteValue)) {
+      return "";
+    }
+    bytes[index / 2] = byteValue;
+  }
+
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    let decodedValue = "";
+    for (let index = 2; index + 1 < bytes.length; index += 2) {
+      decodedValue += String.fromCharCode((bytes[index] << 8) | bytes[index + 1]);
+    }
+    return decodedValue;
+  }
+
+  return new TextDecoder("latin1").decode(bytes);
+}
+
+function extractCartManifestSubjectFromPdfBytes(pdfBytes) {
+  const pdfText = new TextDecoder("latin1").decode(pdfBytes);
+  const literalSubjectMatch = pdfText.match(
+    /\/Subject\s*\((TECHHUB_CART_V1:[A-Za-z0-9+/=\s]+)\)/,
+  );
+
+  if (literalSubjectMatch) {
+    return literalSubjectMatch[1].replace(/\s+/g, "");
+  }
+
+  const hexSubjectMatches = pdfText.matchAll(/\/Subject\s*<([0-9A-Fa-f\s]+)>/g);
+  for (const match of hexSubjectMatches) {
+    const decodedSubject = decodePdfHexString(match[1]);
+    if (decodedSubject.startsWith(QUOTE_CART_MANIFEST_PREFIX)) {
+      return decodedSubject;
+    }
+  }
+
+  throw new Error(
+    "This PDF does not contain TechHub cart data. Please upload the original PDF generated by the updated TechHub quote builder.",
+  );
+}
+
+function normalizeQuoteImportHost(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/:\d+$/, "");
+}
+
+function validateQuoteImportStoreHost(storeHost) {
+  const manifestHost = normalizeQuoteImportHost(storeHost);
+  const currentHost = normalizeQuoteImportHost(window.location.hostname);
+  const isSameHost = manifestHost && manifestHost === currentHost;
+  const isTestAliasPair =
+    QUOTE_IMPORT_TEST_HOST_ALIASES.includes(manifestHost) &&
+    QUOTE_IMPORT_TEST_HOST_ALIASES.includes(currentHost);
+
+  if (!isSameHost && !isTestAliasPair) {
+    throw new Error(
+      `This quote belongs to ${manifestHost || "another store"}, not ${currentHost}.`,
+    );
+  }
+}
+
+function normalizeImportedOptionSelections(optionSelections) {
+  if (optionSelections === undefined) {
+    return [];
+  }
+
+  if (!Array.isArray(optionSelections) || optionSelections.length > 50) {
+    throw new Error("The quote contains invalid product-option data.");
+  }
+
+  return optionSelections.map((option) => {
+    const optionId = Number(option?.optionId);
+    const optionValue = option?.optionValue;
+    const hasValidValue =
+      (typeof optionValue === "number" && Number.isFinite(optionValue)) ||
+      (typeof optionValue === "string" &&
+        optionValue.length > 0 &&
+        optionValue.length <= 1000);
+
+    if (!Number.isInteger(optionId) || optionId <= 0 || !hasValidValue) {
+      throw new Error("The quote contains an invalid product option.");
+    }
+
+    return { optionId, optionValue };
+  });
+}
+
+function validateAndNormalizeImportedManifest(manifest) {
+  if (!manifest || typeof manifest !== "object") {
+    throw new Error("The quote PDF cart data is not a valid object.");
+  }
+
+  if (manifest.schema !== QUOTE_CART_MANIFEST_SCHEMA) {
+    throw new Error("This quote uses an unsupported TechHub cart-data version.");
+  }
+
+  validateQuoteImportStoreHost(manifest.storeHost);
+
+  if (
+    !Array.isArray(manifest.items) ||
+    !manifest.items.length ||
+    manifest.items.length > QUOTE_IMPORT_MAX_ITEMS
+  ) {
+    throw new Error("The quote contains an invalid number of products.");
+  }
+
+  const items = manifest.items.map((item) => {
+    const productId = Number(item?.productId);
+    const variantId = Number(item?.variantId);
+    const quantity = Number(item?.quantity);
+
+    if (!Number.isInteger(productId) || productId <= 0) {
+      throw new Error("The quote contains an invalid product ID.");
+    }
+
+    if (
+      !Number.isInteger(quantity) ||
+      quantity <= 0 ||
+      quantity > QUOTE_IMPORT_MAX_QUANTITY
+    ) {
+      throw new Error("The quote contains an invalid product quantity.");
+    }
+
+    const normalizedItem = {
+      productId,
+      quantity,
+      optionSelections: normalizeImportedOptionSelections(
+        item.optionSelections,
+      ),
+    };
+
+    if (item.quotedUnitPrice !== undefined) {
+      const quotedUnitPrice = Number(item.quotedUnitPrice);
+      if (!Number.isFinite(quotedUnitPrice) || quotedUnitPrice < 0) {
+        throw new Error("The quote contains an invalid stored price.");
+      }
+      normalizedItem.quotedUnitPrice = quotedUnitPrice;
+    }
+
+    if (Number.isInteger(variantId) && variantId > 0) {
+      normalizedItem.variantId = variantId;
+    }
+
+    if (typeof item?.name === "string" && item.name.trim()) {
+      normalizedItem.name = item.name.trim().slice(0, 250);
+    }
+
+    if (typeof item?.sku === "string" && item.sku.trim()) {
+      normalizedItem.sku = item.sku.trim().slice(0, 100);
+    }
+
+    return normalizedItem;
+  });
+
+  return {
+    schema: QUOTE_CART_MANIFEST_SCHEMA,
+    createdAt: typeof manifest.createdAt === "string" ? manifest.createdAt : "",
+    currencyCode:
+      typeof manifest.currencyCode === "string" &&
+      /^[A-Za-z]{3}$/.test(manifest.currencyCode)
+        ? manifest.currencyCode.toUpperCase()
+        : "USD",
+    storeHost: normalizeQuoteImportHost(manifest.storeHost),
+    items,
+  };
+}
+
+async function readCartManifestFromPdfFile(file) {
+  if (!file) {
+    throw new Error("Please select a TechHub quote PDF.");
+  }
+
+  if (file.size <= 0 || file.size > QUOTE_IMPORT_MAX_FILE_BYTES) {
+    throw new Error("The selected PDF is empty or larger than 25 MB.");
+  }
+
+  if (!/\.pdf$/i.test(file.name || "")) {
+    throw new Error("Please select a PDF file.");
+  }
+
+  const pdfBytes = new Uint8Array(await file.arrayBuffer());
+  const subject = extractCartManifestSubjectFromPdfBytes(pdfBytes);
+  const encodedManifest = subject.slice(QUOTE_CART_MANIFEST_PREFIX.length);
+
+  let manifest;
+  try {
+    manifest = JSON.parse(decodeUtf8Base64(encodedManifest));
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error("The quote PDF contains malformed cart data.");
+    }
+    throw error;
+  }
+
+  return validateAndNormalizeImportedManifest(manifest);
+}
+
+function buildStorefrontRequestItem(item) {
+  const requestItem = {
+    productId: item.productId,
+    quantity: item.quantity,
+  };
+
+  if (item.variantId) {
+    requestItem.variantId = item.variantId;
+  }
+
+  if (item.optionSelections.length) {
+    requestItem.optionSelections = item.optionSelections;
+  }
+
+  return requestItem;
+}
+
+async function getCurrentStorefrontCart() {
+  const response = await fetch(STOREFRONT_CARTS_URL, {
+    method: "GET",
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `TechHub could not read the current cart (${response.status}).`,
+    );
+  }
+
+  const carts = await response.json();
+  return Array.isArray(carts) ? carts[0] || null : carts || null;
+}
+
+async function getStorefrontApiError(response) {
+  let responseData = null;
+  try {
+    responseData = await response.json();
+  } catch (error) {
+    responseData = null;
+  }
+
+  if (typeof responseData?.detail === "string" && responseData.detail.trim()) {
+    return normalizeStorefrontCartErrorMessage(responseData.detail);
+  }
+
+  if (typeof responseData?.title === "string" && responseData.title.trim()) {
+    return normalizeStorefrontCartErrorMessage(responseData.title);
+  }
+
+  if (responseData?.errors && typeof responseData.errors === "object") {
+    const errorMessages = Object.values(responseData.errors)
+      .flat()
+      .filter((message) => typeof message === "string" && message.trim());
+    if (errorMessages.length) {
+      return normalizeStorefrontCartErrorMessage(errorMessages.join(" "));
+    }
+  }
+
+  return `BigCommerce rejected this item with status ${response.status}.`;
+}
+
+function normalizeStorefrontCartErrorMessage(message) {
+  const normalizedMessage = String(message || "").trim();
+  if (
+    /the following product cannot be ordered online[\s\S]*could not proceed with (?:the )?checkout/i.test(
+      normalizedMessage,
+    )
+  ) {
+    return "this product is not currently (or is no longer) available for purchase.";
+  }
+
+  return normalizedMessage;
+}
+
+async function addImportedItemToCart(cartId, item) {
+  const hasCart = typeof cartId === "string" && cartId.length > 0;
+  const endpoint = hasCart
+    ? `/api/storefront/carts/${encodeURIComponent(cartId)}/items`
+    : "/api/storefront/carts";
+  const response = await fetch(endpoint, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      lineItems: [buildStorefrontRequestItem(item)],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getStorefrontApiError(response));
+  }
+
+  const updatedCart = await response.json();
+  if (!updatedCart || typeof updatedCart.id !== "string") {
+    throw new Error("BigCommerce did not return the updated cart.");
+  }
+
+  return updatedCart;
+}
+
+async function deleteCurrentStorefrontCart(cartId) {
+  if (typeof cartId !== "string" || !cartId) {
+    return;
+  }
+
+  const response = await fetch(
+    `/api/storefront/carts/${encodeURIComponent(cartId)}`,
+    {
+      method: "DELETE",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    },
+  );
+
+  if (!response.ok && response.status !== 404) {
+    throw new Error(
+      `TechHub could not replace the current cart (${response.status}).`,
+    );
+  }
+}
+
+function getImportedItemLabel(item) {
+  if (item.name && item.sku) {
+    return `${item.name} (${item.sku})`;
+  }
+
+  if (item.name) {
+    return item.name;
+  }
+
+  if (item.sku) {
+    return `SKU ${item.sku}`;
+  }
+
+  return `Product ${item.productId}`;
+}
+
+function getStorefrontCartLineItems(cart) {
+  const lineItems = cart?.lineItems || {};
+  return [
+    ...(Array.isArray(lineItems.physicalItems)
+      ? lineItems.physicalItems
+      : []),
+    ...(Array.isArray(lineItems.digitalItems) ? lineItems.digitalItems : []),
+  ];
+}
+
+function storefrontCartHasItems(cart) {
+  const lineItems = cart?.lineItems || {};
+  return [
+    lineItems.physicalItems,
+    lineItems.digitalItems,
+    lineItems.customItems,
+    lineItems.giftCertificates,
+  ].some((items) => Array.isArray(items) && items.length > 0);
+}
+
+function buildOptionSelectionKey(options) {
+  if (!Array.isArray(options)) {
+    return "";
+  }
+
+  return options
+    .map((option) => {
+      const optionId = Number(option?.optionId ?? option?.nameId);
+      const optionValue =
+        option?.optionValue ?? option?.valueId ?? option?.value;
+      if (!Number.isInteger(optionId) || optionValue === undefined) {
+        return null;
+      }
+      return `${optionId}:${String(optionValue)}`;
+    })
+    .filter(Boolean)
+    .sort()
+    .join("|");
+}
+
+function findRestoredLineItem(cart, importedItem) {
+  const matchingProductItems = getStorefrontCartLineItems(cart).filter(
+    (lineItem) => Number(lineItem?.productId) === importedItem.productId,
+  );
+
+  const matchingVariantItems = importedItem.variantId
+    ? matchingProductItems.filter(
+        (lineItem) => Number(lineItem?.variantId) === importedItem.variantId,
+      )
+    : matchingProductItems;
+
+  if (matchingVariantItems.length <= 1) {
+    return matchingVariantItems[0] || null;
+  }
+
+  const importedOptionKey = buildOptionSelectionKey(
+    importedItem.optionSelections,
+  );
+  return (
+    matchingVariantItems.find(
+      (lineItem) =>
+        buildOptionSelectionKey(lineItem.options) === importedOptionKey,
+    ) || null
+  );
+}
+
+function compareRestoredItemPrice(importedItem, updatedCart, quotedCurrencyCode) {
+  if (!Number.isFinite(importedItem.quotedUnitPrice)) {
+    return null;
+  }
+
+  const restoredLineItem = findRestoredLineItem(updatedCart, importedItem);
+  const currentUnitPrice = getStorefrontLineItemUnitPrice(restoredLineItem);
+  if (currentUnitPrice === null) {
+    return null;
+  }
+
+  const currentCurrencyCode =
+    typeof updatedCart?.currency?.code === "string" &&
+    /^[A-Za-z]{3}$/.test(updatedCart.currency.code)
+      ? updatedCart.currency.code.toUpperCase()
+      : quotedCurrencyCode;
+  const quotedUnitPrice = importedItem.quotedUnitPrice;
+  const priceChanged =
+    quotedCurrencyCode !== currentCurrencyCode ||
+    Math.round(quotedUnitPrice * 100) !== Math.round(currentUnitPrice * 100);
+
+  return {
+    changed: priceChanged,
+    item: importedItem,
+    quotedUnitPrice,
+    quotedCurrencyCode,
+    currentUnitPrice,
+    currentCurrencyCode,
+  };
+}
+
+async function restoreCartFromManifest(
+  manifest,
+  mode = "add",
+  knownCurrentCart = undefined,
+) {
+  const currentCart =
+    knownCurrentCart === undefined
+      ? await getCurrentStorefrontCart()
+      : knownCurrentCart;
+  let cartId = currentCart?.id || "";
+
+  if (mode === "replace" && cartId) {
+    await deleteCurrentStorefrontCart(cartId);
+    cartId = "";
+  }
+
+  const restoredItems = [];
+  const failedItems = [];
+  const priceChanges = [];
+  let comparedPriceCount = 0;
+
+  for (const item of manifest.items) {
+    try {
+      const updatedCart = await addImportedItemToCart(cartId, item);
+      cartId = updatedCart.id;
+      restoredItems.push(item);
+      const priceComparison = compareRestoredItemPrice(
+        item,
+        updatedCart,
+        manifest.currencyCode,
+      );
+      if (priceComparison) {
+        comparedPriceCount += 1;
+        if (priceComparison.changed) {
+          priceChanges.push(priceComparison);
+        }
+      }
+    } catch (error) {
+      failedItems.push({
+        item,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return { restoredItems, failedItems, priceChanges, comparedPriceCount };
+}
+
+function injectQuoteImportStyles() {
+  if (document.getElementById("techhub-quote-import-styles")) {
+    return;
+  }
+
+  const styleTag = document.createElement("style");
+  styleTag.id = "techhub-quote-import-styles";
+  styleTag.textContent = `
+    #${QUOTE_IMPORT_BUTTON_ID} {
+      display: inline-flex !important;
+      left: 0 !important;
+      right: auto !important;
+      align-items: center;
+      justify-content: center;
+      z-index: 1;
+    }
+    #${QUOTE_IMPORT_BUTTON_ID}[disabled] {
+      cursor: wait;
+      opacity: 0.65;
+    }
+    #${QUOTE_IMPORT_BUTTON_ID}:hover {
+      background-color: #f0f0f0 !important;
+      color: #000000 !important;
+    }
+    .techhub-quote-import-status {
+      border: 1px solid #b8b8b8;
+      margin: 0 0 1.5rem;
+      padding: 1rem 1.25rem;
+      white-space: pre-line;
+    }
+    .techhub-quote-import-status--success {
+      background: #edf7ed;
+      border-color: #4f8a4f;
+      color: #244624;
+    }
+    .techhub-quote-import-status--warning {
+      background: #fff8e5;
+      border-color: #b88700;
+      color: #5c4500;
+    }
+    .techhub-quote-import-status--error {
+      background: #fff0f0;
+      border-color: #b94a48;
+      color: #7b2321;
+    }
+    .techhub-quote-import-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.25rem;
+      background: rgba(0, 0, 0, 0.62);
+    }
+    .techhub-quote-import-modal[hidden] {
+      display: none !important;
+    }
+    .techhub-quote-import-modal__dialog {
+      width: min(100%, 540px);
+      max-height: calc(100vh - 2.5rem);
+      overflow-y: auto;
+      box-sizing: border-box;
+      background: #ffffff;
+      border: 1px solid #222222;
+      box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.3);
+      padding: 2rem;
+    }
+    .techhub-quote-import-modal__title {
+      margin: 0 0 0.75rem;
+      font-size: 1.5rem;
+      line-height: 1.25;
+    }
+    .techhub-quote-import-modal__description {
+      margin: 0 0 1.5rem;
+      line-height: 1.55;
+    }
+    .techhub-quote-import-modal__actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+    .techhub-quote-import-modal__button {
+      min-height: 44px;
+      padding: 0.7rem 1rem;
+      border: 1px solid #000000;
+      border-radius: 0;
+      font-family: 'Work Sans', sans-serif;
+      font-size: 0.875rem;
+      font-weight: 700;
+      line-height: 1.2;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .techhub-quote-import-modal__button--replace {
+      background: #ffffff;
+      color: #000000;
+    }
+    .techhub-quote-import-modal__button--add {
+      background: #000000;
+      color: #ffffff;
+    }
+    .techhub-quote-import-modal__button--cancel {
+      grid-column: 1 / -1;
+      justify-self: center;
+      min-height: auto;
+      border: 0;
+      background: transparent;
+      color: #333333;
+      text-decoration: underline;
+      text-transform: none;
+    }
+    .techhub-quote-import-modal__button:focus-visible {
+      outline: 3px solid #4d90fe;
+      outline-offset: 2px;
+    }
+    @media (max-width: 540px) {
+      .techhub-cart-header {
+        display: grid !important;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        column-gap: 0.75rem;
+        row-gap: 0.75rem;
+        align-items: stretch;
+      }
+      .techhub-cart-header__title {
+        grid-column: 1 / -1;
+        grid-row: 1;
+        align-self: center;
+        justify-self: center;
+        width: 100%;
+      }
+      #${QUOTE_IMPORT_BUTTON_ID},
+      #empty-cart-btn {
+        position: static !important;
+        top: auto !important;
+        left: auto !important;
+        right: auto !important;
+        transform: none !important;
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        width: 100% !important;
+        min-width: 0;
+        min-height: 41px;
+        margin: 0 !important;
+      }
+      #${QUOTE_IMPORT_BUTTON_ID} {
+        grid-column: 1;
+        grid-row: 2;
+      }
+      #empty-cart-btn {
+        grid-column: 2;
+        grid-row: 2;
+      }
+    }
+    @media (max-width: 360px) {
+      .techhub-cart-header {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      #${QUOTE_IMPORT_BUTTON_ID} {
+        grid-column: 1;
+        grid-row: 2;
+      }
+      #empty-cart-btn {
+        grid-column: 1;
+        grid-row: 3;
+      }
+      .techhub-quote-import-modal__dialog {
+        padding: 1.25rem;
+      }
+      .techhub-quote-import-modal__actions {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .techhub-quote-import-modal__button--cancel {
+        grid-column: 1;
+      }
+    }
+  `;
+  document.head.appendChild(styleTag);
+}
+
+function chooseQuoteImportMode(productCount, totalQuantity) {
+  const existingModal = document.getElementById(QUOTE_IMPORT_MODAL_ID);
+  if (existingModal) {
+    existingModal.remove();
+  }
+
+  const modal = document.createElement("div");
+  modal.id = QUOTE_IMPORT_MODAL_ID;
+  modal.className = "techhub-quote-import-modal";
+  modal.setAttribute("role", "presentation");
+
+  const dialog = document.createElement("div");
+  dialog.className = "techhub-quote-import-modal__dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-labelledby", QUOTE_IMPORT_MODAL_TITLE_ID);
+  dialog.setAttribute("aria-describedby", QUOTE_IMPORT_MODAL_DESCRIPTION_ID);
+
+  const title = document.createElement("h2");
+  title.id = QUOTE_IMPORT_MODAL_TITLE_ID;
+  title.className = "techhub-quote-import-modal__title";
+  title.textContent = "How should this quote be restored?";
+
+  const description = document.createElement("p");
+  description.id = QUOTE_IMPORT_MODAL_DESCRIPTION_ID;
+  description.className = "techhub-quote-import-modal__description";
+  description.textContent = `This quote contains ${productCount} product${
+    productCount === 1 ? "" : "s"
+  } (${totalQuantity} total item${
+    totalQuantity === 1 ? "" : "s"
+  }). Replace removes every item currently in your cart. Add keeps your current items and adds the quote items. Current pricing and availability will apply.`;
+
+  const actions = document.createElement("div");
+  actions.className = "techhub-quote-import-modal__actions";
+
+  function createActionButton(label, modifier, choice) {
+    const actionButton = document.createElement("button");
+    actionButton.type = "button";
+    actionButton.className =
+      `techhub-quote-import-modal__button techhub-quote-import-modal__button--${modifier}`;
+    actionButton.textContent = label;
+    actionButton.dataset.quoteImportChoice = choice;
+    return actionButton;
+  }
+
+  const replaceButton = createActionButton(
+    "Replace current cart",
+    "replace",
+    "replace",
+  );
+  const addButton = createActionButton("Add to current cart", "add", "add");
+  const cancelButton = createActionButton("Cancel", "cancel", "cancel");
+
+  actions.append(replaceButton, addButton, cancelButton);
+  dialog.append(title, description, actions);
+  modal.appendChild(dialog);
+  document.body.appendChild(modal);
+
+  return new Promise((resolve) => {
+    let isResolved = false;
+
+    function finish(choice) {
+      if (isResolved) {
+        return;
+      }
+      isResolved = true;
+      document.removeEventListener("keydown", handleKeydown);
+      modal.remove();
+      resolve(choice);
+    }
+
+    function handleKeydown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(null);
+        return;
+      }
+
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const buttons = [replaceButton, addButton, cancelButton];
+      const currentIndex = buttons.indexOf(document.activeElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex - 1 + buttons.length) % buttons.length
+        : (currentIndex + 1) % buttons.length;
+      event.preventDefault();
+      buttons[nextIndex].focus();
+    }
+
+    modal.addEventListener("click", (event) => {
+      const choiceButton = event.target.closest("[data-quote-import-choice]");
+      if (choiceButton) {
+        const choice = choiceButton.dataset.quoteImportChoice;
+        finish(choice === "cancel" ? null : choice);
+        return;
+      }
+
+      if (event.target === modal) {
+        finish(null);
+      }
+    });
+
+    document.addEventListener("keydown", handleKeydown);
+    addButton.focus();
+  });
+}
+
+function showQuoteImportStatus(message, type = "warning") {
+  const header = document.querySelector(".techhub-cart-header");
+  if (!header) {
+    window.alert(message);
+    return;
+  }
+
+  let statusNode = document.getElementById(QUOTE_IMPORT_STATUS_ID);
+  if (!statusNode) {
+    statusNode = document.createElement("div");
+    statusNode.id = QUOTE_IMPORT_STATUS_ID;
+    statusNode.setAttribute("role", type === "error" ? "alert" : "status");
+    header.insertAdjacentElement("afterend", statusNode);
+  }
+
+  statusNode.className =
+    `techhub-quote-import-status techhub-quote-import-status--${type}`;
+  statusNode.setAttribute("role", type === "error" ? "alert" : "status");
+  statusNode.textContent = message;
+  statusNode.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function formatQuotePrice(amount, currencyCode) {
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: currencyCode || "USD",
+    }).format(amount);
+  } catch (error) {
+    return `${currencyCode || "USD"} ${Number(amount).toFixed(2)}`;
+  }
+}
+
+function buildQuoteImportResultMessage(result) {
+  const restoredCount = result.restoredItems.length;
+  const failedCount = result.failedItems.length;
+  const priceChanges = Array.isArray(result.priceChanges)
+    ? result.priceChanges
+    : [];
+  const comparedPriceCount = Number(result.comparedPriceCount) || 0;
+  const messageLines = [
+    `Restored ${restoredCount} of ${restoredCount + failedCount} products.`,
+  ];
+
+  if (restoredCount) {
+    messageLines.push(
+      "Successfully added products were restored using current TechHub pricing and availability.",
+    );
+  }
+
+  if (priceChanges.length) {
+    messageLines.push("", "Price changes detected (current prices were used):");
+    priceChanges.forEach((priceChange) => {
+      messageLines.push(
+        `- ${getImportedItemLabel(priceChange.item)}: ${formatQuotePrice(
+          priceChange.quotedUnitPrice,
+          priceChange.quotedCurrencyCode,
+        )} → ${formatQuotePrice(
+          priceChange.currentUnitPrice,
+          priceChange.currentCurrencyCode,
+        )}`,
+      );
+    });
+  } else if (restoredCount && comparedPriceCount === restoredCount) {
+    messageLines.push("No quoted unit prices have changed.");
+  } else if (restoredCount && comparedPriceCount < restoredCount) {
+    const unavailableCount = restoredCount - comparedPriceCount;
+    messageLines.push(
+      `Price comparison was unavailable for ${unavailableCount} restored product${
+        unavailableCount === 1 ? "" : "s"
+      }. Older quote PDFs do not contain stored prices.`,
+    );
+  }
+
+  if (failedCount) {
+    messageLines.push("", "Products that could not be added:");
+    result.failedItems.forEach(({ item, message }) => {
+      messageLines.push(`- ${getImportedItemLabel(item)}: ${message}`);
+    });
+  }
+
+  return messageLines.join("\n");
+}
+
+function storeQuoteImportResult(message, type) {
+  try {
+    window.sessionStorage.setItem(
+      QUOTE_IMPORT_RESULT_STORAGE_KEY,
+      JSON.stringify({ message, type }),
+    );
+  } catch (error) {
+    console.warn("Unable to retain the quote import result after reload:", error);
+  }
+}
+
+function showStoredQuoteImportResult() {
+  try {
+    const storedValue = window.sessionStorage.getItem(
+      QUOTE_IMPORT_RESULT_STORAGE_KEY,
+    );
+    if (!storedValue) {
+      return;
+    }
+
+    window.sessionStorage.removeItem(QUOTE_IMPORT_RESULT_STORAGE_KEY);
+    const result = JSON.parse(storedValue);
+    if (result?.message) {
+      showQuoteImportStatus(result.message, result.type || "warning");
+    }
+  } catch (error) {
+    console.warn("Unable to display the previous quote import result:", error);
+  }
+}
+
+function setQuoteImportBusy(button, isBusy) {
+  button.disabled = isBusy;
+  button.setAttribute("aria-busy", isBusy ? "true" : "false");
+  button.textContent = isBusy ? "UPLOADING QUOTE..." : "UPLOAD QUOTE";
+}
+
+function applyQuoteUploadButtonInlineStyles(button) {
+  button.style.cssText = `
+    font-family: 'Work Sans', sans-serif !important;
+    text-transform: uppercase !important;
+    font-weight: 700 !important;
+    font-size: 9pt !important;
+    width: 185px;
+    height: 40px;
+    padding: 0 5px !important;
+    box-sizing: border-box;
+    background-color: #ffffff;
+    color: #000000 !important;
+    border-radius: 0 !important;
+    border: 1px solid #000000 !important;
+    display: inline-block !important;
+    text-align: center !important;
+    line-height: 40px !important;
+    text-decoration: none !important;
+    transition: background-color 0.3s ease;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+  `;
+}
+
+function isQuoteCartPage() {
+  return (
+    typeof window !== "undefined" &&
+    window.location &&
+    window.location.pathname === "/cart.php"
+  );
+}
+
+async function handleQuotePdfSelection(file, button, input) {
+  setQuoteImportBusy(button, true);
+
+  try {
+    const manifest = await readCartManifestFromPdfFile(file);
+    const totalQuantity = manifest.items.reduce(
+      (total, item) => total + item.quantity,
+      0,
+    );
+    const currentCart = await getCurrentStorefrontCart();
+    const importMode = storefrontCartHasItems(currentCart)
+      ? await chooseQuoteImportMode(manifest.items.length, totalQuantity)
+      : "add";
+
+    if (!importMode) {
+      return;
+    }
+
+    button.textContent =
+      importMode === "replace" ? "REPLACING CART..." : "ADDING TO CART...";
+    const result = await restoreCartFromManifest(
+      manifest,
+      importMode,
+      currentCart,
+    );
+    const message = buildQuoteImportResultMessage(result);
+    const type = result.failedItems.length
+      ? result.restoredItems.length
+        ? "warning"
+        : "error"
+      : result.priceChanges.length
+        ? "warning"
+        : "success";
+
+    if (result.restoredItems.length) {
+      storeQuoteImportResult(message, type);
+      window.location.reload();
+      return;
+    }
+
+    showQuoteImportStatus(message, type);
+  } catch (error) {
+    console.error("Quote PDF import failed:", error);
+    showQuoteImportStatus(
+      error instanceof Error ? error.message : String(error),
+      "error",
+    );
+  } finally {
+    input.value = "";
+    setQuoteImportBusy(button, false);
+  }
+}
+
+function initializeQuotePdfImportInterface() {
+  if (!isQuoteCartPage()) {
+    return false;
+  }
+
+  if (document.getElementById(QUOTE_IMPORT_BUTTON_ID)) {
+    return true;
+  }
+
+  const header = document.querySelector(".techhub-cart-header");
+  if (!header) {
+    return false;
+  }
+
+  injectQuoteImportStyles();
+
+  const uploadButton = document.createElement("button");
+  uploadButton.id = QUOTE_IMPORT_BUTTON_ID;
+  uploadButton.type = "button";
+  uploadButton.className =
+    "button button--white techhub-cart-header__action techhub-cart-header__action--upload";
+  uploadButton.textContent = "UPLOAD QUOTE";
+  uploadButton.setAttribute("aria-label", "Upload a saved TechHub quote PDF");
+  uploadButton.setAttribute("aria-busy", "false");
+  applyQuoteUploadButtonInlineStyles(uploadButton);
+
+  const fileInput = document.createElement("input");
+  fileInput.id = QUOTE_IMPORT_INPUT_ID;
+  fileInput.type = "file";
+  fileInput.accept = ".pdf,application/pdf";
+  fileInput.hidden = true;
+
+  const title = header.querySelector(".techhub-cart-header__title");
+  header.insertBefore(uploadButton, title || header.firstChild);
+  header.appendChild(fileInput);
+
+  uploadButton.addEventListener("click", () => {
+    if (!uploadButton.disabled) {
+      fileInput.click();
+    }
+  });
+
+  fileInput.addEventListener("change", () => {
+    const selectedFile = fileInput.files?.[0];
+    if (selectedFile) {
+      handleQuotePdfSelection(selectedFile, uploadButton, fileInput);
+    }
+  });
+
+  showStoredQuoteImportResult();
+  return true;
+}
+
+function initializeQuotePdfImportWhenReady() {
+  if (!isQuoteCartPage()) {
+    return;
+  }
+
+  const initialize = () => {
+    if (initializeQuotePdfImportInterface()) {
+      return;
+    }
+
+    if (typeof MutationObserver !== "function") {
+      return;
+    }
+
+    const observer = new MutationObserver(() => {
+      if (initializeQuotePdfImportInterface()) {
+        observer.disconnect();
+      }
+    });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+    window.setTimeout(() => observer.disconnect(), 15000);
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initialize, { once: true });
+  } else {
+    initialize();
+  }
 }
 
 // =========================================
@@ -649,8 +1971,8 @@ function buildQuoteDocumentModel({ cartData, compatibilityData, date }) {
     grandTotalText: cartData?.grandTotalText || "",
     footer: {
       disclaimerHtml: `
-        <p><strong>Pricing and stock are subject to change.</strong>
-        Quote pricing will be honored for 14 days while inventory lasts.</p>
+        <p><strong>This quote is not a pricing guarantee. Due to fluctuations in the technology market, pricing may change without notice. We recommend being attentive to cartzs pricing at the time of purchase.</strong></p>
+        
         <p>An approved purchaser can log in to
         <a href="https://techhub.tamu.edu/" class="pdf-link">TechHub</a>
         to complete the purchase. See
@@ -1666,7 +2988,7 @@ function paginateDocument(root, metrics) {
 // PDF Export Layer
 // =========================================
 
-async function exportPdf(container, opt) {
+async function exportPdf(container, opt, cartManifest) {
   if (!container) {
     throw new Error("Cannot export PDF without a container.");
   }
@@ -1851,6 +3173,18 @@ async function exportPdf(container, opt) {
       });
     }
 
+    if (typeof pdf.setProperties !== "function") {
+      throw new Error("jsPDF metadata support is unavailable.");
+    }
+
+    pdf.setProperties({
+      title: "TechHub Quote",
+      subject: buildCartManifestPdfSubject(cartManifest),
+      author: "Texas A&M University TechHub",
+      keywords: `${QUOTE_CART_MANIFEST_SCHEMA}, restorable cart`,
+      creator: "TechHub Quote Builder",
+    });
+
     pdf.save(opt?.filename || "TechHub Quote.pdf");
   } finally {
     if (!hadExportClass) {
@@ -1873,7 +3207,12 @@ function cloneFixtureData(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function createFixtureSnapshot({ cartData, compatibilityData, model }) {
+function createFixtureSnapshot({
+  cartData,
+  compatibilityData,
+  model,
+  cartManifest = null,
+}) {
   const pathname =
     typeof window !== "undefined" ? window.location.pathname : "";
   return {
@@ -1883,6 +3222,7 @@ function createFixtureSnapshot({ cartData, compatibilityData, model }) {
     cartData: cloneFixtureData(cartData),
     compatibilityData: cloneFixtureData(compatibilityData),
     model: cloneFixtureData(model),
+    cartManifest: cloneFixtureData(cartManifest),
   };
 }
 
@@ -1931,6 +3271,7 @@ function buildModelFromFixture(fixture) {
       ? fixture.cartData
       : { items: [], grandTotalText: "" };
   const compatibilityData = fixture.compatibilityData || null;
+  const cartManifest = fixture.cartManifest || null;
 
   const fixtureDate = fixture.capturedAt
     ? new Date(fixture.capturedAt)
@@ -1942,6 +3283,7 @@ function buildModelFromFixture(fixture) {
   return {
     cartData,
     compatibilityData,
+    cartManifest,
     model: buildQuoteDocumentModel({
       cartData,
       compatibilityData,
@@ -1997,18 +3339,24 @@ function initializeQuotePdfTestNamespace() {
       return snapshot;
     },
     async loadFixtureFromObject(fixture) {
-      const { cartData, compatibilityData, model } =
+      const { cartData, compatibilityData, cartManifest, model } =
         buildModelFromFixture(fixture);
       const snapshot = createFixtureSnapshot({
         cartData,
         compatibilityData,
         model,
+        cartManifest,
       });
       setLatestFixtureSnapshot(snapshot);
 
       const pagedRoot = await renderAndPaginateModel(model);
       const exportOptions = buildQuoteExportOptions(model);
-      await exportPdf(pagedRoot, exportOptions);
+      if (!cartManifest) {
+        throw new Error(
+          "This fixture does not contain a cart manifest for PDF export.",
+        );
+      }
+      await exportPdf(pagedRoot, exportOptions, cartManifest);
 
       return {
         pageCount: Array.from(pagedRoot.querySelectorAll(".pdf-page")).filter(
@@ -2049,6 +3397,7 @@ function initializeQuotePdfTestNamespace() {
 
 async function generateQuotePdf() {
   const cartData = extractCartData();
+  const cartManifest = await fetchCurrentCartManifest();
   const compatibilityData = await buildCompatibilityData(cartData);
   const model = buildQuoteDocumentModel({
     cartData,
@@ -2056,16 +3405,22 @@ async function generateQuotePdf() {
     date: new Date(),
   });
   setLatestFixtureSnapshot(
-    createFixtureSnapshot({ cartData, compatibilityData, model }),
+    createFixtureSnapshot({
+      cartData,
+      compatibilityData,
+      model,
+      cartManifest,
+    }),
   );
 
   const pagedRoot = await renderAndPaginateModel(model);
   const exportOptions = buildQuoteExportOptions(model);
 
-  await exportPdf(pagedRoot, exportOptions);
+  await exportPdf(pagedRoot, exportOptions, cartManifest);
 }
 
 initializeQuotePdfTestNamespace();
+initializeQuotePdfImportWhenReady();
 
 document.addEventListener("click", async function (event) {
   if (event.target && event.target.id === "generate-quote") {
@@ -2073,6 +3428,9 @@ document.addEventListener("click", async function (event) {
       await generateQuotePdf();
     } catch (error) {
       console.error("Quote PDF generation failed:", error);
+      window.alert(
+        "TechHub could not generate a restorable quote PDF. Please refresh the cart and try again.",
+      );
     }
   }
 
