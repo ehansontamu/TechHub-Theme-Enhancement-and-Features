@@ -1971,7 +1971,7 @@ function buildQuoteDocumentModel({ cartData, compatibilityData, date }) {
     grandTotalText: cartData?.grandTotalText || "",
     footer: {
       disclaimerHtml: `
-        <p><strong>This quote is not a pricing guarantee. Due to fluctuations in the technology market, pricing may change without notice. We recommend being attentive to cartzs pricing at the time of purchase.</strong></p>
+        <p><strong>This quote is not a pricing guarantee. Due to fluctuations in the technology market, pricing may change without notice. We recommend being attentive to in-cart pricing at the time of purchase.</strong></p>
         
         <p>An approved purchaser can log in to
         <a href="https://techhub.tamu.edu/" class="pdf-link">TechHub</a>
