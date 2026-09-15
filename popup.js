@@ -9,7 +9,10 @@
 
   var MODAL_TITLE = "Please Note:";
   var MODAL_BODY =
-    "Due to ongoing changes in the technology market, product pricing is subject to change without notice. We appreciate your understanding as we work to provide competitive pricing and availability.";
+    "Due to ongoing changes in the technology market, product pricing is subject to change without notice. We appreciate your understanding as we work to provide competitive pricing and availability. Learn more ";
+
+  var LEARN_MORE_URL =
+    "https://tamu.mybigcommerce.com/faqs/#:~:text=Why%20did%20a%20product%20price%20change%3F";
 
   var BUTTON_TEXT = "I Understand";
 
@@ -132,12 +135,30 @@
     body.style.padding = "18px";
 
     var bodyText = document.createElement("div");
-    bodyText.textContent = MODAL_BODY;
     bodyText.style.fontFamily =
       "'Work Sans', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif";
     bodyText.style.fontSize = "18px";
     bodyText.style.lineHeight = "1.5";
     bodyText.style.color = COLOR_TEXT;
+
+    bodyText.appendChild(document.createTextNode(MODAL_BODY));
+
+    var learnMoreLink = document.createElement("a");
+    learnMoreLink.href = LEARN_MORE_URL;
+    learnMoreLink.textContent = "here";
+    learnMoreLink.style.color = COLOR_MAROON;
+    learnMoreLink.style.fontWeight = "600";
+    learnMoreLink.style.textDecoration = "underline";
+
+    // Clicking "here" counts as dismissing the notice.
+    // The link still opens normally after the timestamp is saved.
+    learnMoreLink.addEventListener("click", function () {
+      setDismissedState();
+      backdrop.remove();
+    });
+
+    bodyText.appendChild(learnMoreLink);
+    bodyText.appendChild(document.createTextNode("."));
 
     var footer = document.createElement("div");
     footer.style.padding = "18px";
