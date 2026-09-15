@@ -1,7 +1,7 @@
 
 //Prod Version
 const COMPATIBILITY_DATA_URL =
-  "https://store-jsj7fos9p1.mybigcommerce.com/content/JSON%20Files/Compatibility.json";
+  "https://store-jsj7fos9p1.mybigcommerce.com/content/JSON%20Files/compatibility_superapp.json";
 
 function setCookie(name, value, days) {
   let expires = "";
