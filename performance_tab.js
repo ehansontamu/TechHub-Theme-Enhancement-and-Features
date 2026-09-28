@@ -1,5 +1,6 @@
 (function addPerformanceTab() {
     var JSON_URL = 'https://store-jsj7fos9p1.mybigcommerce.com/content/JSON%20Files/filteredResponse.json';
+    var DISCONTINUED_BIGCOMMERCE_CATEGORY_IDS = [49, 50, 51, 52];
 
 	function normalizeSku(value) {
 		return String(value || '').trim().toUpperCase();
@@ -86,8 +87,24 @@
         });
     }
 
-    function isEligibleComputer(item) {
+    function isPerformanceRecord(item) {
         return !!getComputerType(item.Category) && hasCompleteScores(item) && parsePrice(item.NormalPrice) !== null;
+    }
+
+    function isDiscontinuedProduct(item) {
+        if (!item || !Array.isArray(item.BigCommerceCategoryIds)) {
+            return false;
+        }
+
+        return item.BigCommerceCategoryIds.some(function(categoryId) {
+            return DISCONTINUED_BIGCOMMERCE_CATEGORY_IDS.indexOf(categoryId) !== -1;
+        });
+    }
+
+    function isEligibleComputer(item) {
+        return isPerformanceRecord(item) &&
+            Array.isArray(item.BigCommerceCategoryIds) &&
+            !isDiscontinuedProduct(item);
     }
 
     function formatMetricNumber(value, decimals) {
@@ -1574,15 +1591,29 @@
                 return response.json();
             })
             .then(function(data) {
-                var cleanData = data.filter(function(item) {
-                    return isEligibleComputer(item);
+                var performanceRecords = data.filter(function(item) {
+                    return isPerformanceRecord(item);
                 });
 
-			var exactMatch = cleanData.find(function(item) {
+			var recordsMissingCategoryIds = performanceRecords.filter(function(item) {
+				return !Array.isArray(item.BigCommerceCategoryIds);
+			});
+
+			if (recordsMissingCategoryIds.length) {
+				console.error(
+					'Performance tab error: performance-eligible records are missing BigCommerceCategoryIds. Publish the updated filteredResponse.json before rendering the tab.',
+					recordsMissingCategoryIds.map(function(item) {
+						return item.sku || '(missing SKU)';
+					})
+				);
+				return;
+			}
+
+			var exactMatch = performanceRecords.find(function(item) {
 				return normalizeSku(item.sku) === currentSku;
 			});
 
-			var prefixMatches = cleanData.filter(function(item) {
+			var prefixMatches = performanceRecords.filter(function(item) {
 				return skuMatchesByPrefix(currentSku, item.sku);
 			});
 
@@ -1593,6 +1624,14 @@
                 if (!currentItem) {
                     return;
                 }
+
+                if (isDiscontinuedProduct(currentItem)) {
+                    return;
+                }
+
+                var cleanData = data.filter(function(item) {
+                    return isEligibleComputer(item);
+                });
 
                 currentItem.pageSkuPrefix = currentSku;
 
